@@ -45,6 +45,7 @@ static const char *put_kwlist[] = {"item", "block", "timeout", NULL};
 static const char *put_many_kwlist[] = {"items", "block", "timeout", NULL};
 static const char *get_kwlist[] = {"block", "timeout", NULL};
 static const char *get_many_kwlist[] = {"items", "block", "timeout", NULL};
+static const char *join_kwlist[] = {"timeout", NULL};
 
 
 static PyObject * EmptyError;
@@ -131,6 +132,29 @@ Queue_dealloc(Queue *self)
     Py_TYPE(self)->tp_free(reinterpret_cast<PyObject*>(self));
 }
 
+static int
+_parse_timeout(PyObject *py_timeout, double & timeout)
+{
+    /* timeout < 0 => Value Error
+     */
+    timeout = PyFloat_AsDouble(py_timeout);
+    if (PyErr_Occurred()) {
+        PyErr_Format(PyExc_ValueError, "'timeout' is not a valid float");
+        return -1;
+    }
+
+    if (timeout < 0) {
+        PyErr_Format(PyExc_ValueError, "'timeout' must be positive");
+        return -1;
+    }
+
+    if (timeout > static_cast<double>(std::numeric_limits<time_t>::max())) {
+        PyErr_Format(PyExc_OverflowError, "timeout is too large");
+        return -1;
+    }
+
+    return 1;
+}
 
 static int
 _parse_block_and_timeout(
@@ -144,28 +168,15 @@ _parse_block_and_timeout(
         block = false;
     }
 
-    /* timeout = None => only block is used
-     * timeout < 0 => Value Error
-     * timeout > 0 wait for timeout
-     * timeout == 0 => block = false
-     */
+    // timeout = None => only block is used
     if (py_timeout != NULL and py_timeout != Py_None) {
-        timeout = PyFloat_AsDouble(py_timeout);
-        if (PyErr_Occurred()) {
-            PyErr_Format(PyExc_ValueError, "'timeout' is not a valid float");
+        if (_parse_timeout(py_timeout, timeout) == -1) {
             return -1;
         }
 
-        if (timeout < 0) {
-            PyErr_Format(PyExc_ValueError, "'timeout' must be positive");
-            return -1;
-        }
-
-        if (timeout > static_cast<double>(std::numeric_limits<time_t>::max())) {
-            PyErr_Format(PyExc_OverflowError, "timeout is too large");
-            return -1;
-        }
-
+        /* timeout > 0 wait for timeout
+         * timeout == 0 => block = false
+         */
         if (timeout == 0) {
             block = false;
         }
@@ -269,7 +280,7 @@ Queue_put(Queue *self, PyObject *args, PyObject *kwargs)
 
     PyObject *py_timeout=NULL;
     double timeout = 0;
-    
+
     if (not PyArg_ParseTupleAndKeywords(
                                 args,
                                 kwargs,
@@ -457,7 +468,7 @@ Queue_get(Queue *self, PyObject *args, PyObject *kwargs)
 
     bool block=true;
     double timeout = 0;
-    
+
     if(not PyArg_ParseTupleAndKeywords(
                                 args,
                                 kwargs,
@@ -622,9 +633,46 @@ _blocked_wait_all_tasks_done(Queue* self, boost::mutex::scoped_lock& lock)
     self->bridge->all_tasks_done_cond.wait(lock);
 }
 
-static PyObject*
-Queue_join(Queue* self)
+static bool
+_timed_wait_all_tasks_done(
+        Queue* self,
+        boost::mutex::scoped_lock& lock,
+        boost::system_time& timeout
+        )
 {
+    AllowThreads raii_lock;
+    return self->bridge->all_tasks_done_cond.timed_wait(lock, timeout);
+}
+
+static PyObject*
+Queue_join(Queue* self, PyObject *args, PyObject *kwargs)
+{
+    PyObject *py_timeout=NULL;
+
+    boost::system_time abs_timeout = boost::get_system_time();
+    bool timed_wait = false;
+
+    if(not PyArg_ParseTupleAndKeywords(
+                                args,
+                                kwargs,
+                                "|O:join",
+                                const_cast<char**>(join_kwlist),
+                                &py_timeout))
+    {
+        return NULL;
+    }
+
+    if (py_timeout != NULL and py_timeout != Py_None) {
+        double timeout = 0;
+        if (_parse_timeout(py_timeout, timeout) == -1) {
+            return NULL;
+        }
+
+        boost::uint64_t timeout_millis = static_cast<boost::uint64_t>(timeout*1000);
+        abs_timeout += boost::posix_time::milliseconds(timeout_millis);
+        timed_wait = true;
+    }
+
     BEGIN_SAFE_CALL
 
     boost::mutex::scoped_lock lock(self->bridge->mutex, boost::try_to_lock);
@@ -632,12 +680,20 @@ Queue_join(Queue* self)
         _wait_for_lock(lock);
     }
 
-    while (self->unfinished_tasks) {
-        _blocked_wait_all_tasks_done(self, lock);
+    if (timed_wait) {
+        while (self->unfinished_tasks) {
+            if (not _timed_wait_all_tasks_done(self, lock, abs_timeout)) {
+                Py_RETURN_FALSE;
+            }
+        }
+    } else {
+        while (self->unfinished_tasks) {
+            _blocked_wait_all_tasks_done(self, lock);
+        }
     }
 
     END_SAFE_CALL("Error in join: %s", NULL)
-    Py_RETURN_NONE;
+    Py_RETURN_TRUE;
 }
 
 static PyMethodDef Queue_methods[] = {
@@ -651,7 +707,7 @@ static PyMethodDef Queue_methods[] = {
     {"put_many", (PyCFunction)Queue_put_many, METH_VARARGS|METH_KEYWORDS, ""},
     {"get_many", (PyCFunction)Queue_get_many, METH_VARARGS|METH_KEYWORDS, ""},
     {"task_done", (PyCFunction)Queue_task_done, METH_NOARGS, ""},
-    {"join", (PyCFunction)Queue_join, METH_NOARGS, ""},
+    {"join", (PyCFunction)Queue_join, METH_VARARGS|METH_KEYWORDS, ""},
     {NULL, NULL, 0, NULL}
 };
 
@@ -789,11 +845,11 @@ PyMODINIT_FUNC
 #if PY_MAJOR_VERSION >= 3
 PyInit_boost_queue(void)
 {
-	return moduleinit();
+    return moduleinit();
 }
 #else
 initboost_queue(void)
 {
-	moduleinit();
+    moduleinit();
 }
 #endif

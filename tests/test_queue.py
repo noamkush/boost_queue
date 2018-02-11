@@ -14,6 +14,7 @@ else:
 
 
 class TestQueue(TestCase):
+
     def test_put(self):
         q = Queue(1)
         q.put(None)
@@ -44,6 +45,7 @@ class TestQueue(TestCase):
             q.get(1, 1)
 
     def test_get_put_with_thread_and_late_get(self):
+
         def producer(q):
             [q.put(x, True, 0.1) for x in range(400)]
 
@@ -62,6 +64,7 @@ class TestQueue(TestCase):
         t2.join()
 
     def test_get_put_with_thread_and_late_put(self):
+
         def consumer(test, q):
             to_consume = list(range(40))
             for x in range(40):
@@ -81,6 +84,15 @@ class TestQueue(TestCase):
 
         t1.join()
         t2.join()
+
+    def test_join_timeout(self):
+        queue = Queue()
+        queue.put(0)
+        self.assertFalse(queue.join(0.001))
+
+        queue.get()
+        queue.task_done()
+        self.assertTrue(queue.join(0.001))
 
     def test_unrealistic_max_size(self):
         with self.assertRaises(OverflowError):
@@ -105,6 +117,9 @@ class TestQueue(TestCase):
         with self.assertRaises(OverflowError):
             q.put(1, True, 2 ** 72)
 
+        with self.assertRaises(OverflowError):
+            q.join(2 ** 72)
+
     def test_negative_timeout(self):
         q = Queue()
         with self.assertRaises(ValueError):
@@ -112,6 +127,9 @@ class TestQueue(TestCase):
 
         with self.assertRaises(ValueError):
             q.put('data', True, -1)
+
+        with self.assertRaises(ValueError):
+            q.join(-1)
 
     def test_except_with_std_queue_full(self):
         q = Queue(1)
